@@ -347,10 +347,10 @@ def main():
             items = bo_by_idx[idx]
             if not items: continue
             L.append(f"\n{IDX_LABELS[idx]} ({len(items)}개)")
-            for e in items[:20]:
+            for e in items[:50]:
                 L.append(f"  <code>{e['ticker']}</code>  ${e['price']}  ({e['sma200']}%)")
             if len(items) > 20:
-                L.append(f"  ... 외 {len(items)-20}개")
+                L.append(f"  ... 외 {len(items)-50}개")
     send_tg("\n".join(L));  time.sleep(1)
 
     # ── 메시지2: 브레드스 ─────────────────────────────────────────────
@@ -402,7 +402,7 @@ def main():
         L.append("\n오늘 두 조건 동시 충족 종목 없음")
     else:
         L.append("")
-        for s in both[:20]:
+        for s in both[:50]:
             L.append(f"  <code>{s['ticker']}</code>  ${s['price']:.2f}  +{s['change']:.2f}%")
     send_tg("\n".join(L));  time.sleep(1)
 
