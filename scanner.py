@@ -433,15 +433,17 @@ def main():
              "⚠️ 데이터 수집 실패 — Yahoo Finance 응답 없음"]
     send_tg("\n".join(L))
 
-    # ── 메시지7: 50일 이격도 ────────────────────────────────────────────────
+    # ── 메시지7: 50일 이격도 (미국 선물) ──────────────────────────────────────
     print("[10] 50일 이격도 수집")
     disp_results = {}
     for key, cfg in DISPARITY_CFG.items():
         disp_results[key] = get_disparity(cfg["symbol"], cfg)
         time.sleep(0.5)
 
+    US_KEYS = ["sp500", "nasdaq"]
     L = [f"📐 <b>50일선 이격도</b> | {TODAY}", ""]
-    for key, cfg in DISPARITY_CFG.items():
+    for key in US_KEYS:
+        cfg = DISPARITY_CFG[key]
         d = disp_results.get(key)
         if not d:
             L.append(f"<b>{cfg['name']}</b>: 데이터 없음\n")
@@ -459,6 +461,28 @@ def main():
         L.append("")
     L += ["이격도 = 현재가 ÷ 50일선 × 100",
           "기준: 이그전(이은택의 그림전략) 응용"]
+    send_tg("\n".join(L));  time.sleep(1)
+
+    # ── 메시지8: 50일 이격도 (코스피) ─────────────────────────────────────────
+    cfg = DISPARITY_CFG["kospi"]
+    d = disp_results.get("kospi")
+    if d:
+        arrow = "▲" if d["change"] > 0 else "▼"
+        emoji = ZONE_EMOJI.get(d["zone"], "⚪")
+        L = [f"📐 <b>50일선 이격도 (코스피)</b> | {TODAY}", "",
+             f"{emoji} <b>{cfg['name']}</b>",
+             f"  이격도: {d['disparity']:.1f}%  ·  {d['label']}",
+             f"  현재가: {d['current']:,.2f}  {arrow} {abs(d['change']):,.2f} ({d['chg_pct']:+.2f}%)",
+             f"  50일선: {d['ma50']:,.2f}"]
+        if d["zone"] == "overheat":
+            L.append(f"  ⚠️ Panic Buying 자제 구간")
+        elif d["zone"] == "cooldown":
+            L.append(f"  🔵 Panic Selling 자제, 이격 조정 끝난 업종 관심")
+        L += ["", "이격도 = 현재가 ÷ 50일선 × 100",
+              "기준: 이그전(이은택의 그림전략) 응용"]
+    else:
+        L = [f"📐 <b>50일선 이격도 (코스피)</b> | {TODAY}",
+             "⚠️ 데이터 수집 실패"]
     send_tg("\n".join(L))
 
     print("=== 완료 ===")
