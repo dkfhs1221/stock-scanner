@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
 미국 주식 스캐너 - GitHub Actions 버전
-6개 텔레그램 메시지:
+7개 텔레그램 메시지:
   1. 200일선 돌파 (인덱스별)
   2. 시장 브레드스 (50MA / 200MA 위 비율)
   3. 거래량 급증 (2배↑, 50MA위, +3%↑)
   4. 52주 신고가 돌파
   5. 거래량급증 + 신고가 교집합
   6. VIX Term Structure
+  7. 50일 이격도 (S&P500선물 / 나스닥선물 / 코스피)
 """
 
-import os, json, time, re
+import os, json, time, re, urllib.parse
 import requests
 from bs4 import BeautifulSoup
 from datetime import date
@@ -182,6 +183,44 @@ def scrape_overview(idx_code: str, extra: str = "") -> list[dict]:
         r += 20
         time.sleep(0.6)
     return results
+
+
+# ─── 50일 이격도 ──────────────────────────────────────────────────────────────
+DISPARITY_CFG = {
+    "sp500":  {"symbol": "ES=F",  "name": "S&P500 선물",  "overheat": 110.0, "caution": 105.0, "cooldown": 95.0},
+    "nasdaq": {"symbol": "NQ=F",  "name": "나스닥 선물",  "overheat": 110.0, "caution": 105.0, "cooldown": 95.0},
+    "kospi":  {"symbol": "^KS11", "name": "코스피",       "overheat": 130.0, "caution": 120.0, "cooldown": 105.0},
+}
+
+def get_disparity(symbol: str, cfg: dict) -> dict | None:
+    enc = urllib.parse.quote(symbol, safe="")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{enc}"
+    try:
+        r = requests.get(url, params={"range": "6mo", "interval": "1d"},
+                         headers={**HEADERS, "Accept": "application/json"}, timeout=20)
+        res = r.json()["chart"]["result"][0]
+        closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None]
+        if len(closes) < 50:
+            return None
+        current   = closes[-1]
+        prev      = closes[-2] if len(closes) >= 2 else current
+        ma50      = sum(closes[-50:]) / 50
+        disparity = current / ma50 * 100
+        change    = current - prev
+        chg_pct   = change / prev * 100 if prev else 0
+        ov, cau, cd = cfg["overheat"], cfg["caution"], cfg["cooldown"]
+        if   disparity >= ov:  zone, label = "overheat", f"과열권 (≥{ov:.0f}%)"
+        elif disparity >= cau: zone, label = "caution",  f"과열 경계 ({cau:.0f}~{ov:.0f}%)"
+        elif disparity <= cd:  zone, label = "cooldown", f"과열 해소 (≤{cd:.0f}%)"
+        else:                  zone, label = "normal",   f"정상 범위 ({cd:.0f}~{ov:.0f}%)"
+        return {"current": current, "prev": prev, "ma50": ma50,
+                "disparity": disparity, "change": change, "chg_pct": chg_pct,
+                "zone": zone, "label": label}
+    except Exception as e:
+        print(f"  이격도 오류 ({symbol}): {e}")
+        return None
+
+ZONE_EMOJI = {"overheat": "🔴", "caution": "🟠", "normal": "🟢", "cooldown": "🔵"}
 
 
 # ─── Yahoo Finance ────────────────────────────────────────────────────────────
@@ -392,6 +431,34 @@ def main():
     else:
         L = [f"🌡️ <b>VIX Term Structure</b> | {TODAY}",
              "⚠️ 데이터 수집 실패 — Yahoo Finance 응답 없음"]
+    send_tg("\n".join(L))
+
+    # ── 메시지7: 50일 이격도 ────────────────────────────────────────────────
+    print("[10] 50일 이격도 수집")
+    disp_results = {}
+    for key, cfg in DISPARITY_CFG.items():
+        disp_results[key] = get_disparity(cfg["symbol"], cfg)
+        time.sleep(0.5)
+
+    L = [f"📐 <b>50일선 이격도</b> | {TODAY}", ""]
+    for key, cfg in DISPARITY_CFG.items():
+        d = disp_results.get(key)
+        if not d:
+            L.append(f"<b>{cfg['name']}</b>: 데이터 없음\n")
+            continue
+        arrow = "▲" if d["change"] > 0 else "▼"
+        emoji = ZONE_EMOJI.get(d["zone"], "⚪")
+        L.append(f"{emoji} <b>{cfg['name']}</b>")
+        L.append(f"  이격도: {d['disparity']:.1f}%  ·  {d['label']}")
+        L.append(f"  현재가: {d['current']:,.2f}  {arrow} {abs(d['change']):,.2f} ({d['chg_pct']:+.2f}%)")
+        L.append(f"  50일선: {d['ma50']:,.2f}")
+        if d["zone"] == "overheat":
+            L.append(f"  ⚠️ Panic Buying 자제 구간")
+        elif d["zone"] == "cooldown":
+            L.append(f"  🔵 Panic Selling 자제, 이격 조정 끝난 업종 관심")
+        L.append("")
+    L += ["이격도 = 현재가 ÷ 50일선 × 100",
+          "기준: 이그전(이은택의 그림전략) 응용"]
     send_tg("\n".join(L))
 
     print("=== 완료 ===")
