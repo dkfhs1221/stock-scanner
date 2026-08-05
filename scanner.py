@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""
+미국 주식 스캐너 - GitHub Actions 버전
+6개 텔레그램 메시지:
+  1. 200일선 돌파 (인덱스별)
+  2. 시장 브레드스 (50MA / 200MA 위 비율)
+  3. 거래량 급증 (2배↑, 50MA위, +3%↑)
+  4. 52주 신고가 돌파
+  5. 거래량급증 + 신고가 교집합
+  6. VIX Term Structure
+"""
+
+import os, json, time, re
+import requests
+from bs4 import BeautifulSoup
+from datetime import date
+
+# ─── 설정 ────────────────────────────────────────────────────────────────────
+TG_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+SNAPSHOT   = "data/snapshot.json"
+TODAY      = date.today().isoformat()
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+IDX_ORDER  = ["dji", "ndx", "sp500", "rut"]
+IDX_LABELS = {
+    "dji":   "🔵 다우30",
+    "ndx":   "🟣 나스닥100",
+    "sp500": "🟢 S&P500",
+    "rut":   "🟡 러셀2000",
+}
+IDX_SHORT  = {"dji": "DJI", "ndx": "NDX", "sp500": "SPX", "rut": "RUT"}
+
+
+# ─── 유틸 ────────────────────────────────────────────────────────────────────
+def send_tg(text: str) -> bool:
+    url  = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    resp = requests.post(url, json={"chat_id": TG_CHAT_ID,
+                                    "text": text, "parse_mode": "HTML"}, timeout=30)
+    ok = resp.json().get("ok", False)
+    if not ok:
+        print(f"  [TG 오류] {resp.text[:200]}")
+    return ok
+
+
+def fetch(url: str, retries: int = 3) -> str | None:
+    for i in range(retries):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code == 200:
+                return r.text
+            print(f"  HTTP {r.status_code}: {url[:80]}")
+        except Exception as e:
+            print(f"  요청 오류({i+1}/{retries}): {e}")
+        time.sleep(2 ** i)
+    return None
+
+
+def load_snapshot() -> dict:
+    if os.path.exists(SNAPSHOT):
+        with open(SNAPSHOT, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_snapshot(data: dict):
+    os.makedirs("data", exist_ok=True)
+    with open(SNAPSHOT, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def vvix_label(v: float) -> str:
+    if v < 80:  return "매우 안정"
+    if v < 100: return "정상"
+    if v < 120: return "경계구간 ⚡"
+    if v < 140: return "위험 🔴"
+    if v < 160: return "강한공포"
+    return "금융스트레스 🆘"
+
+
+# ─── Finviz 스크래핑 ──────────────────────────────────────────────────────────
+def get_count(filter_str: str) -> int:
+    """필터 조건에 맞는 총 종목 수 반환"""
+    html = fetch(f"https://finviz.com/screener.ashx?v=111&f={filter_str}&r=1")
+    if not html:
+        return 0
+    m = re.search(r"#1[^/]*/\s*([\d,]+)", html)
+    if not m:
+        m = re.search(r"Total:?\s*([\d,]+)", html, re.I)
+    if m:
+        return int(m.group(1).replace(",", ""))
+    if "No results" in html:
+        return 0
+    soup = BeautifulSoup(html, "html.parser")
+    return len(soup.find_all("tr", valign="top"))
+
+
+def scrape_technical(idx_code: str) -> dict:
+    """Technical 뷰(v=171) — ticker: {sma200, price, indices}"""
+    results = {}
+    r = 1
+    while True:
+        html = fetch(f"https://finviz.com/screener.ashx?v=171&f=idx_{idx_code}&r={r}")
+        if not html:
+            break
+        soup = BeautifulSoup(html, "html.parser")
+        rows = soup.find_all("tr", valign="top")
+        if not rows:
+            break
+        for row in rows:
+            tds = row.find_all("td")
+            if len(tds) < 11:
+                continue
+            anchors = tds[1].find_all("a")
+            ticker  = anchors[-1].text.strip() if anchors else tds[1].text.strip()
+            try:
+                sma200 = float(tds[6].text.strip().replace("%", ""))
+                price  = tds[10].text.strip()
+                results[ticker] = {"sma200": sma200, "price": price}
+            except Exception:
+                pass
+        if len(rows) < 20:
+            break
+        r += 20
+        time.sleep(0.6)
+    return results
+
+
+def _detect_col(html: str) -> tuple[int, int]:
+    """Overview 뷰의 price/change% td 인덱스 자동 탐지 (기본 8, 9)"""
+    soup = BeautifulSoup(html, "html.parser")
+    rows = soup.find_all("tr", valign="top")
+    if not rows:
+        return 8, 9
+    for row in rows:
+        tds = row.find_all("td")
+        for i, td in enumerate(tds):
+            t = td.text.strip()
+            if re.match(r"^[+-]\d+\.\d{2}%$", t) and 6 < i < 14:
+                return i - 1, i   # price = change - 1
+    return 8, 9
+
+
+def scrape_overview(idx_code: str, extra: str = "") -> list[dict]:
+    """Overview 뷰(v=111) — [{ticker, price, change, idx}]"""
+    results   = []
+    price_idx = 8
+    chg_idx   = 9
+    r = 1
+    f = f"idx_{idx_code},{extra}" if extra else f"idx_{idx_code}"
+    while True:
+        html = fetch(f"https://finviz.com/screener.ashx?v=111&f={f}&r={r}")
+        if not html:
+            break
+        if r == 1:                          # 첫 페이지에서 컬럼 탐지
+            price_idx, chg_idx = _detect_col(html)
+        soup = BeautifulSoup(html, "html.parser")
+        rows = soup.find_all("tr", valign="top")
+        if not rows:
+            break
+        for row in rows:
+            tds = row.find_all("td")
+            if len(tds) <= chg_idx:
+                continue
+            anchors = tds[1].find_all("a")
+            ticker  = anchors[-1].text.strip() if anchors else tds[1].text.strip()
+            try:
+                price  = float(tds[price_idx].text.strip())
+                change = float(tds[chg_idx].text.strip().replace("%", ""))
+                results.append({"ticker": ticker, "price": price,
+                                 "change": change, "idx": idx_code})
+            except Exception:
+                pass
+        if len(rows) < 20:
+            break
+        r += 20
+        time.sleep(0.6)
+    return results
+
+
+# ─── Yahoo Finance ────────────────────────────────────────────────────────────
+def get_yf_price(symbol: str) -> dict | None:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        r = requests.get(url, params={"interval": "1d", "range": "5d"},
+                         headers={**HEADERS, "Accept": "application/json"}, timeout=15)
+        meta  = r.json()["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice", 0)
+        prev  = meta.get("previousClose") or meta.get("chartPreviousClose") or price
+        return {"price": price, "chg_pct": (price - prev) / prev * 100 if prev else 0}
+    except Exception as e:
+        print(f"  YF 오류 ({symbol}): {e}")
+        return None
+
+
+# ─── 메인 ────────────────────────────────────────────────────────────────────
+def main():
+    print(f"=== 스캐너 시작: {TODAY} ===")
+
+    snap     = load_snapshot()
+    prev_date = snap.get("date")
+    prev_sma  = snap.get("sma200", {})
+
+    # ── 1. Technical 데이터 수집 (200일선용) ──────────────────────────────
+    print("[1] Technical 데이터 수집")
+    all_data: dict[str, dict] = {}
+    for idx in IDX_ORDER:
+        print(f"  {idx}...")
+        data = scrape_technical(idx)
+        for ticker, d in data.items():
+            if ticker not in all_data:
+                all_data[ticker] = {**d, "indices": []}
+            if idx not in all_data[ticker]["indices"]:
+                all_data[ticker]["indices"].append(idx)
+        time.sleep(1)
+    total = len(all_data)
+    print(f"  총 {total}개")
+
+    # ── 2. 200일선 돌파 탐지 ─────────────────────────────────────────────
+    bo_by_idx: dict[str, list] = {i: [] for i in IDX_ORDER}
+    bo_all: set[str] = set()
+    if prev_date and prev_date != TODAY:
+        for ticker, d in all_data.items():
+            pv = prev_sma.get(ticker)
+            cv = d["sma200"]
+            if pv is not None and pv <= 0 < cv:
+                bo_all.add(ticker)
+                for idx in d["indices"]:
+                    bo_by_idx[idx].append(
+                        {"ticker": ticker, "sma200": f"{cv:+.2f}", "price": d["price"]}
+                    )
+        for idx in IDX_ORDER:
+            bo_by_idx[idx].sort(key=lambda x: float(x["sma200"]), reverse=True)
+
+    # ── 3. 스냅샷 저장 ───────────────────────────────────────────────────
+    save_snapshot({"date": TODAY, "sma200": {t: d["sma200"] for t, d in all_data.items()}})
+    print(f"[3] 스냅샷 저장 완료")
+
+    # ── 4. 브레드스 ──────────────────────────────────────────────────────
+    print("[4] 브레드스 수집")
+    breadth: dict[str, dict] = {}
+    for idx in IDX_ORDER:
+        n     = get_count(f"idx_{idx}")
+        a50   = get_count(f"idx_{idx},ta_sma50_pa")
+        a200  = get_count(f"idx_{idx},ta_sma200_pa")
+        breadth[idx] = {
+            "n": n,
+            "p50":  f"{a50 /n*100:.1f}" if n else "?",
+            "p200": f"{a200/n*100:.1f}" if n else "?",
+        }
+        time.sleep(0.5)
+
+    # ── 5. 거래량 급증 ───────────────────────────────────────────────────
+    print("[5] 거래량 급증 스캐너")
+    vol_by_idx: dict[str, list] = {i: [] for i in IDX_ORDER}
+    for idx in IDX_ORDER:
+        stocks = scrape_overview(idx, "sh_relvol_o2,ta_sma50_pa")
+        vol_by_idx[idx] = sorted(
+            [s for s in stocks if s["change"] >= 3.0],
+            key=lambda x: x["change"], reverse=True
+        )
+        time.sleep(1)
+
+    # ── 6. 52주 신고가 ──────────────────────────────────────────────────
+    print("[6] 52주 신고가 스캐너")
+    hi_by_idx: dict[str, list] = {i: [] for i in IDX_ORDER}
+    for idx in IDX_ORDER:
+        stocks = scrape_overview(idx, "ta_highlow52w_nh")
+        hi_by_idx[idx] = sorted(stocks, key=lambda x: x["change"], reverse=True)
+        time.sleep(1)
+
+    # ── 7. 교집합 ────────────────────────────────────────────────────────
+    vol_set = {s["ticker"] for v in vol_by_idx.values() for s in v}
+    seen: set[str] = set()
+    both: list[dict] = []
+    for s in (s for v in hi_by_idx.values() for s in v):
+        if s["ticker"] in vol_set and s["ticker"] not in seen:
+            seen.add(s["ticker"])
+            both.append(s)
+
+    # ── 8. VIX ──────────────────────────────────────────────────────────
+    print("[8] VIX 수집")
+    vix  = get_yf_price("%5EVIX")
+    vix1m = get_yf_price("%5EVIX1M")
+    vxmt = get_yf_price("%5EVXMT")
+    vvix = get_yf_price("%5EVVIX")
+
+    # ════════════════════════════════════════════════════════════════════
+    # 텔레그램 발송
+    # ════════════════════════════════════════════════════════════════════
+    print("[9] 텔레그램 발송")
+
+    # ── 메시지1: 200일선 돌파 ──────────────────────────────────────────
+    L = [f"📊 <b>200일선 돌파 스캐너</b> | {TODAY}",
+         f"총 스캔: {total:,}개  |  돌파: {len(bo_all)}개"]
+    if not prev_date:
+        L.append("\n⚠️ 전일 데이터 없음 — 오늘 베이스라인 저장 완료.\n내일부터 정상 작동합니다.")
+    elif not bo_all:
+        L.append("\n오늘 새로 200일선을 돌파한 종목이 없습니다.")
+    else:
+        for idx in IDX_ORDER:
+            items = bo_by_idx[idx]
+            if not items: continue
+            L.append(f"\n{IDX_LABELS[idx]} ({len(items)}개)")
+            for e in items[:20]:
+                L.append(f"  <code>{e['ticker']}</code>  ${e['price']}  ({e['sma200']}%)")
+            if len(items) > 20:
+                L.append(f"  ... 외 {len(items)-20}개")
+    send_tg("\n".join(L));  time.sleep(1)
+
+    # ── 메시지2: 브레드스 ─────────────────────────────────────────────
+    L = [f"📈 <b>시장 브레드스</b> | {TODAY}", "",
+         "         50MA위   200MA위"]
+    for idx in IDX_ORDER:
+        b = breadth[idx]
+        L.append(f"{IDX_SHORT[idx]:>4}    {b['p50']:>5}%    {b['p200']:>5}%")
+    L += ["", "⚠️ 기준: 50MA / 200MA 40% 이하 = 시장 약세 신호"]
+    send_tg("\n".join(L));  time.sleep(1)
+
+    # ── 메시지3: 거래량 급증 ───────────────────────────────────────────
+    vol_total = sum(len(v) for v in vol_by_idx.values())
+    L = [f"🔥 <b>거래량 급증 스캐너</b> | {TODAY}",
+         f"조건: 거래량2배↑ · 50MA위 · 당일+3%↑  |  총 {vol_total}개"]
+    if vol_total == 0:
+        L.append("\n오늘 조건 충족 종목 없음")
+    else:
+        for idx in IDX_ORDER:
+            items = vol_by_idx[idx]
+            if not items: continue
+            L.append(f"\n{IDX_LABELS[idx]} ({len(items)}개)")
+            for s in items[:15]:
+                L.append(f"  <code>{s['ticker']}</code>  ${s['price']:.2f}  +{s['change']:.2f}%")
+            if len(items) > 15:
+                L.append(f"  ... 외 {len(items)-15}개")
+    send_tg("\n".join(L));  time.sleep(1)
+
+    # ── 메시지4: 52주 신고가 ──────────────────────────────────────────
+    hi_total = sum(len(v) for v in hi_by_idx.values())
+    L = [f"🏆 <b>52주 신고가 돌파</b> | {TODAY}", f"총 {hi_total}개"]
+    if hi_total == 0:
+        L.append("\n오늘 52주 신고가 종목 없음")
+    else:
+        for idx in IDX_ORDER:
+            items = hi_by_idx[idx]
+            if not items: continue
+            L.append(f"\n{IDX_LABELS[idx]} ({len(items)}개)")
+            for s in items[:15]:
+                L.append(f"  <code>{s['ticker']}</code>  ${s['price']:.2f}  +{s['change']:.2f}%")
+            if len(items) > 15:
+                L.append(f"  ... 외 {len(items)-15}개")
+    send_tg("\n".join(L));  time.sleep(1)
+
+    # ── 메시지5: 교집합 ───────────────────────────────────────────────
+    L = [f"⭐ <b>거래량급증 + 신고가 동시 돌파</b> | {TODAY}",
+         f"강력 모멘텀 신호  |  총 {len(both)}개"]
+    if not both:
+        L.append("\n오늘 두 조건 동시 충족 종목 없음")
+    else:
+        L.append("")
+        for s in both[:20]:
+            L.append(f"  <code>{s['ticker']}</code>  ${s['price']:.2f}  +{s['change']:.2f}%")
+    send_tg("\n".join(L));  time.sleep(1)
+
+    # ── 메시지6: VIX Term Structure ───────────────────────────────────
+    if vix and vxmt and vvix:
+        v1 = vix1m["price"] if vix1m else vix["price"]
+        v1_note = "" if vix1m else " (Spot VIX)"
+        v3 = vxmt["price"]
+        diff = v1 - v3
+        if   diff > 0: ts = "Backwardation ⚠️\n→ 단기공포 신호 (급락 전 선행 패턴)"
+        elif diff < 0: ts = "Contango ✅\n→ 정상 구조 (장기불확실성 > 단기)"
+        else:          ts = "Flat ➡️ 구조 중립"
+        extra = f"\n⚠️ 단기공포 강함 (spread {diff:+.1f}pt)" if diff > 2 else ""
+        vv = vvix["price"]
+        L = [
+            f"🌡️ <b>VIX Term Structure</b> | {TODAY}", "",
+            f"VIX:    {vix['price']:.2f}  ({vix['chg_pct']:+.1f}%)",
+            f"VIX1M:  {v1:.2f}{v1_note}",
+            f"VIX3M:  {v3:.2f}  (VXMT 93일)", "",
+            f"Term Structure: {ts}{extra}",
+            f"Spread: {diff:+.2f}pt (VIX1M - VIX3M)", "",
+            f"VVIX: {vv:.0f}  {vvix_label(vv)}",
+            "80↓안정 | 80~100정상 | 100~120경계⚡",
+            "120~140위험🔴 | 140~160강한공포 | 160↑금융스트레스🆘",
+        ]
+    else:
+        L = [f"🌡️ <b>VIX Term Structure</b> | {TODAY}",
+             "⚠️ 데이터 수집 실패 — Yahoo Finance 응답 없음"]
+    send_tg("\n".join(L))
+
+    print("=== 완료 ===")
+
+
+if __name__ == "__main__":
+    main()
