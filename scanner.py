@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
 미국 주식 스캐너 - GitHub Actions 버전
-7개 텔레그램 메시지:
+일반 실행 (오전 7시 KST) — 7개 메시지:
   1. 200일선 돌파 (인덱스별)
   2. 시장 브레드스 (50MA / 200MA 위 비율)
   3. 거래량 급증 (2배↑, 50MA위, +3%↑)
   4. 52주 신고가 돌파
   5. 거래량급증 + 신고가 교집합
   6. VIX Term Structure
-  7. 50일 이격도 (S&P500선물 / 나스닥선물 / 코스피)
+  7. 50일 이격도 (S&P500선물 / 나스닥선물)
+KOSPI_ONLY=true (오후 4시 10분 KST) — 1개 메시지:
+  8. 50일 이격도 (코스피 당일 종가 기준)
 """
 
 import os, json, time, re, urllib.parse
@@ -17,10 +19,11 @@ from bs4 import BeautifulSoup
 from datetime import date
 
 # ─── 설정 ────────────────────────────────────────────────────────────────────
-TG_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-SNAPSHOT   = "data/snapshot.json"
-TODAY      = date.today().isoformat()
+TG_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+TG_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
+KOSPI_ONLY  = os.environ.get("KOSPI_ONLY", "").lower() in ("1", "true", "yes")
+SNAPSHOT    = "data/snapshot.json"
+TODAY       = date.today().isoformat()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -144,7 +147,7 @@ def _detect_col(html: str) -> tuple[int, int]:
         for i, td in enumerate(tds):
             t = td.text.strip()
             if re.match(r"^[+-]\d+\.\d{2}%$", t) and 6 < i < 14:
-                return i - 1, i   # price = change - 1
+                return i - 1, i
     return 8, 9
 
 
@@ -159,7 +162,7 @@ def scrape_overview(idx_code: str, extra: str = "") -> list[dict]:
         html = fetch(f"https://finviz.com/screener.ashx?v=111&f={f}&r={r}")
         if not html:
             break
-        if r == 1:                          # 첫 페이지에서 컬럼 탐지
+        if r == 1:
             price_idx, chg_idx = _detect_col(html)
         soup = BeautifulSoup(html, "html.parser")
         rows = soup.find_all("tr", valign="top")
@@ -241,6 +244,32 @@ def get_yf_price(symbol: str) -> dict | None:
 # ─── 메인 ────────────────────────────────────────────────────────────────────
 def main():
     print(f"=== 스캐너 시작: {TODAY} ===")
+
+    # ── KOSPI 전용 모드 (오후 4시 10분 KST 별도 실행) ────────────────────────
+    if KOSPI_ONLY:
+        print("[KOSPI] 이격도 수집")
+        cfg = DISPARITY_CFG["kospi"]
+        d = get_disparity(cfg["symbol"], cfg)
+        if d:
+            arrow = "▲" if d["change"] > 0 else "▼"
+            emoji = ZONE_EMOJI.get(d["zone"], "⚪")
+            L = [f"📐 <b>50일선 이격도 (코스피)</b> | {TODAY}", "",
+                 f"{emoji} <b>{cfg['name']}</b>",
+                 f"  이격도: {d['disparity']:.1f}%  ·  {d['label']}",
+                 f"  현재가: {d['current']:,.2f}  {arrow} {abs(d['change']):,.2f} ({d['chg_pct']:+.2f}%)",
+                 f"  50일선: {d['ma50']:,.2f}"]
+            if d["zone"] == "overheat":
+                L.append(f"  ⚠️ Panic Buying 자제 구간")
+            elif d["zone"] == "cooldown":
+                L.append(f"  🔵 Panic Selling 자제, 이격 조정 끝난 업종 관심")
+            L += ["", "이격도 = 현재가 ÷ 50일선 × 100",
+                  "기준: 이그전(이은택의 그림전략) 응용"]
+        else:
+            L = [f"📐 <b>50일선 이격도 (코스피)</b> | {TODAY}",
+                 "⚠️ 데이터 수집 실패"]
+        send_tg("\n".join(L))
+        print("=== 완료 ===")
+        return
 
     snap     = load_snapshot()
     prev_date = snap.get("date")
@@ -349,7 +378,7 @@ def main():
             L.append(f"\n{IDX_LABELS[idx]} ({len(items)}개)")
             for e in items[:50]:
                 L.append(f"  <code>{e['ticker']}</code>  ${e['price']}  ({e['sma200']}%)")
-            if len(items) > 20:
+            if len(items) > 50:
                 L.append(f"  ... 외 {len(items)-50}개")
     send_tg("\n".join(L));  time.sleep(1)
 
@@ -434,13 +463,12 @@ def main():
     send_tg("\n".join(L))
 
     # ── 메시지7: 50일 이격도 (미국 선물) ──────────────────────────────────────
-    print("[10] 50일 이격도 수집")
-    disp_results = {}
-    for key, cfg in DISPARITY_CFG.items():
-        disp_results[key] = get_disparity(cfg["symbol"], cfg)
-        time.sleep(0.5)
-
+    print("[10] 50일 이격도 수집 (미국 선물)")
     US_KEYS = ["sp500", "nasdaq"]
+    disp_results = {}
+    for key in US_KEYS:
+        disp_results[key] = get_disparity(DISPARITY_CFG[key]["symbol"], DISPARITY_CFG[key])
+        time.sleep(0.5)
     L = [f"📐 <b>50일선 이격도</b> | {TODAY}", ""]
     for key in US_KEYS:
         cfg = DISPARITY_CFG[key]
@@ -462,28 +490,6 @@ def main():
     L += ["이격도 = 현재가 ÷ 50일선 × 100",
           "기준: 이그전(이은택의 그림전략) 응용"]
     send_tg("\n".join(L));  time.sleep(1)
-
-    # ── 메시지8: 50일 이격도 (코스피) ─────────────────────────────────────────
-    cfg = DISPARITY_CFG["kospi"]
-    d = disp_results.get("kospi")
-    if d:
-        arrow = "▲" if d["change"] > 0 else "▼"
-        emoji = ZONE_EMOJI.get(d["zone"], "⚪")
-        L = [f"📐 <b>50일선 이격도 (코스피)</b> | {TODAY}", "",
-             f"{emoji} <b>{cfg['name']}</b>",
-             f"  이격도: {d['disparity']:.1f}%  ·  {d['label']}",
-             f"  현재가: {d['current']:,.2f}  {arrow} {abs(d['change']):,.2f} ({d['chg_pct']:+.2f}%)",
-             f"  50일선: {d['ma50']:,.2f}"]
-        if d["zone"] == "overheat":
-            L.append(f"  ⚠️ Panic Buying 자제 구간")
-        elif d["zone"] == "cooldown":
-            L.append(f"  🔵 Panic Selling 자제, 이격 조정 끝난 업종 관심")
-        L += ["", "이격도 = 현재가 ÷ 50일선 × 100",
-              "기준: 이그전(이은택의 그림전략) 응용"]
-    else:
-        L = [f"📐 <b>50일선 이격도 (코스피)</b> | {TODAY}",
-             "⚠️ 데이터 수집 실패"]
-    send_tg("\n".join(L))
 
     print("=== 완료 ===")
 
