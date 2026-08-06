@@ -32,14 +32,13 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-IDX_ORDER  = ["dji", "ndx", "sp500", "rut"]
+IDX_ORDER  = ["dji", "ndx", "sp500"]
 IDX_LABELS = {
     "dji":   "🔵 다우30",
     "ndx":   "🟣 나스닥100",
     "sp500": "🟢 S&P500",
-    "rut":   "🟡 러셀2000",
 }
-IDX_SHORT  = {"dji": "DJI", "ndx": "NDX", "sp500": "SPX", "rut": "RUT"}
+IDX_SHORT  = {"dji": "DJI", "ndx": "NDX", "sp500": "SPX"}
 
 
 # ─── 유틸 ────────────────────────────────────────────────────────────────────
