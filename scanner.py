@@ -401,10 +401,10 @@ def main():
             items = vol_by_idx[idx]
             if not items: continue
             L.append(f"\n{IDX_LABELS[idx]} ({len(items)}개)")
-            for s in items[:15]:
+            for s in items[:50]:
                 L.append(f"  <code>{s['ticker']}</code>  ${s['price']:.2f}  +{s['change']:.2f}%")
-            if len(items) > 15:
-                L.append(f"  ... 외 {len(items)-15}개")
+            if len(items) > 50:
+                L.append(f"  ... 외 {len(items)-50}개")
     send_tg("\n".join(L));  time.sleep(1)
 
     # ── 메시지4: 52주 신고가 ──────────────────────────────────────────
@@ -417,10 +417,10 @@ def main():
             items = hi_by_idx[idx]
             if not items: continue
             L.append(f"\n{IDX_LABELS[idx]} ({len(items)}개)")
-            for s in items[:15]:
+            for s in items[:50]:
                 L.append(f"  <code>{s['ticker']}</code>  ${s['price']:.2f}  +{s['change']:.2f}%")
-            if len(items) > 15:
-                L.append(f"  ... 외 {len(items)-15}개")
+            if len(items) > 50:
+                L.append(f"  ... 외 {len(items)-50}개")
     send_tg("\n".join(L));  time.sleep(1)
 
     # ── 메시지5: 교집합 ───────────────────────────────────────────────
