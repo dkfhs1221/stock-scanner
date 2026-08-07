@@ -266,25 +266,28 @@ def get_fear_greed() -> dict | None:
 
 # ─── TGA (재무부 일반계좌) ────────────────────────────────────────────────────
 def get_tga() -> dict | None:
-    """Treasury FiscalData — 백만달러→십억달러, 날짜별 최댓값이 TGA 본계좌"""
-    url = "https://api.fiscaldata.treasury.gov/services/api/v1/accounting/core/operating_cash_balance/"
+    """Treasury FiscalData DTS — TGA 마감잔고 (백만달러→십억달러)"""
+    url = (
+        "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
+        "/v1/accounting/dts/operating_cash_balance"
+    )
     try:
         r = requests.get(url, params={
-            "fields": "record_date,open_today_bal",
-            "sort":   "-record_date",
-            "limit":  "20",
+            "fields":     "record_date,account_type,open_today_bal",
+            "filter":     "account_type:eq:Treasury General Account (TGA) Closing Balance",
+            "sort":       "-record_date",
+            "page[size]": "10",
         }, headers={**HEADERS, "Accept": "application/json"}, timeout=25)
         r.raise_for_status()
         data = r.json().get("data", [])
         print(f"  TGA rows: {len(data)}")
         if not data:
             return None
-        # 날짜별 그룹핑, 최댓값 = TGA 본계좌
         by_date: dict[str, float] = {}
         for row in data:
             dt  = row["record_date"]
             val = float(row["open_today_bal"])
-            by_date[dt] = max(by_date.get(dt, 0), val)
+            by_date[dt] = val
         dates = sorted(by_date.keys(), reverse=True)
         if len(dates) < 2:
             return None
@@ -298,8 +301,8 @@ def get_tga() -> dict | None:
 
 # ─── RRP (역레포) — NY Fed API ────────────────────────────────────────────────
 def get_rrp() -> dict | None:
-    """NY Fed 역레포 — totalAmtAccepted 백만달러→십억달러"""
-    url = "https://markets.newyorkfed.org/api/rp/reverserepo/propositions/results/lastTwoWeeks.json"
+    """NY Fed 역레포 — totalAmtAccepted 달러→십억달러"""
+    url = "https://markets.newyorkfed.org/api/rp/reverserepo/all/results/lastTwoWeeks.json"
     try:
         r = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=20)
         r.raise_for_status()
@@ -308,7 +311,7 @@ def get_rrp() -> dict | None:
         daily: dict[str, float] = {}
         for op in ops:
             dt  = op.get("operationDate", "")[:10]
-            amt = float(op.get("totalAmtAccepted", 0)) / 1_000   # 백만 → 십억
+            amt = float(op.get("totalAmtAccepted", 0)) / 1_000_000_000   # 달러 → 십억
             if dt:
                 daily[dt] = daily.get(dt, 0) + amt
         dates = sorted(daily.keys())
@@ -360,8 +363,7 @@ def main():
                 L.append(f"  ⚠️ Panic Buying 자제 구간")
             elif d["zone"] == "cooldown":
                 L.append(f"  🔵 Panic Selling 자제, 이격 조정 끝난 업종 관심")
-            L += ["", "이격도 = 현재가 ÷ 50일선 × 100",
-                  "기준: 이그전(이은택의 그림전략) 응용"]
+            L += ["", "이격도 = 현재가 ÷ 50일선 × 100"]
         else:
             L = [f"📐 <b>50일선 이격도 (코스피)</b> | {TODAY}", "⚠️ 데이터 수집 실패"]
         send_tg("\n".join(L))
@@ -401,7 +403,7 @@ def main():
             else:           judge = "TGA↑ + RRP↑  →  이중 흡수 ⛔  시장에 부정적"
             L += [f"📊 <b>종합 판단</b>", f"  {judge}", ""]
         L += ["TGA↓·RRP↓ = 유동성 공급 | TGA↑·RRP↑ = 유동성 흡수",
-              "출처: US Treasury FiscalData · FRED(RRPONTSYD)"]
+              "출처: US Treasury FiscalData · NY Fed"]
         send_tg("\n".join(L))
         print("=== 완료 ===")
         return
@@ -626,8 +628,7 @@ def main():
         elif d["zone"] == "cooldown":
             L.append(f"  🔵 Panic Selling 자제, 이격 조정 끝난 업종 관심")
         L.append("")
-    L += ["이격도 = 현재가 ÷ 50일선 × 100",
-          "기준: 이그전(이은택의 그림전략) 응용"]
+    L += ["이격도 = 현재가 ÷ 50일선 × 100"
     send_tg("\n".join(L));  time.sleep(1)
 
     print("=== 완료 ===")
