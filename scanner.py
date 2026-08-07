@@ -266,51 +266,60 @@ def get_fear_greed() -> dict | None:
 
 # ─── TGA (재무부 일반계좌) ────────────────────────────────────────────────────
 def get_tga() -> dict | None:
+    """Treasury FiscalData — 백만달러→십억달러, 날짜별 최댓값이 TGA 본계좌"""
     url = "https://api.fiscaldata.treasury.gov/services/api/v1/accounting/core/operating_cash_balance/"
     try:
         r = requests.get(url, params={
             "fields": "record_date,open_today_bal",
-            "filter": "account_type:eq:1",
             "sort":   "-record_date",
-            "limit":  "10",
-        }, headers=HEADERS, timeout=20)
+            "limit":  "20",
+        }, headers={**HEADERS, "Accept": "application/json"}, timeout=25)
+        r.raise_for_status()
         data = r.json().get("data", [])
-        if len(data) < 2:
+        print(f"  TGA rows: {len(data)}")
+        if not data:
             return None
-        latest = data[0]
-        prev   = data[min(5, len(data) - 1)]
-        cur_b  = float(latest["open_today_bal"]) / 1_000
-        prv_b  = float(prev["open_today_bal"])   / 1_000
-        chg    = cur_b - prv_b
-        return {"date": latest["record_date"], "current": cur_b, "previous": prv_b, "change": chg}
+        # 날짜별 그룹핑, 최댓값 = TGA 본계좌
+        by_date: dict[str, float] = {}
+        for row in data:
+            dt  = row["record_date"]
+            val = float(row["open_today_bal"])
+            by_date[dt] = max(by_date.get(dt, 0), val)
+        dates = sorted(by_date.keys(), reverse=True)
+        if len(dates) < 2:
+            return None
+        cur_b = by_date[dates[0]] / 1_000
+        prv_b = by_date[dates[min(5, len(dates) - 1)]] / 1_000
+        return {"date": dates[0], "current": cur_b, "previous": prv_b, "change": cur_b - prv_b}
     except Exception as e:
         print(f"  TGA 오류: {e}")
         return None
 
 
-# ─── RRP (역레포) ─────────────────────────────────────────────────────────────
+# ─── RRP (역레포) — NY Fed API ────────────────────────────────────────────────
 def get_rrp() -> dict | None:
-    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+    """NY Fed 역레포 — totalAmtAccepted 백만달러→십억달러"""
+    url = "https://markets.newyorkfed.org/api/rp/reverserepo/propositions/results/lastTwoWeeks.json"
     try:
-        r = requests.get(url, params={"id": "RRPONTSYD"},
-                         headers={**HEADERS, "Accept": "text/csv,text/plain,*/*"}, timeout=20)
+        r = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=20)
         r.raise_for_status()
-        print(f"  RRP size: {len(r.text)}, first80: {r.text[:80]!r}")
-        lines = r.text.strip().split('\n')
-        valid = []
-        for line in lines:
-            parts = line.strip().split(',')
-            if len(parts) == 2 and parts[1] not in ('', '.', 'RRPONTSYD'):
-                try:
-                    valid.append((parts[0].strip(), float(parts[1].strip())))
-                except ValueError:
-                    pass
-        if len(valid) < 2:
+        ops = r.json().get("repo", {}).get("operations", [])
+        print(f"  RRP ops: {len(ops)}")
+        daily: dict[str, float] = {}
+        for op in ops:
+            dt  = op.get("operationDate", "")[:10]
+            amt = float(op.get("totalAmtAccepted", 0)) / 1_000   # 백만 → 십억
+            if dt:
+                daily[dt] = daily.get(dt, 0) + amt
+        dates = sorted(daily.keys())
+        print(f"  RRP dates: {dates}")
+        if len(dates) < 2:
             return None
-        latest_date, cur_b = valid[-1]
-        _, prv_b = valid[max(-6, -len(valid))]   # min→max 버그 수정
-        chg = cur_b - prv_b
-        return {"date": latest_date, "current": cur_b, "previous": prv_b, "change": chg}
+        latest_date = dates[-1]
+        prev_date   = dates[max(0, len(dates) - 6)]
+        cur_b = daily[latest_date]
+        prv_b = daily[prev_date]
+        return {"date": latest_date, "current": cur_b, "previous": prv_b, "change": cur_b - prv_b}
     except Exception as e:
         print(f"  RRP 오류: {e}")
         return None
