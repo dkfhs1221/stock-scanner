@@ -225,6 +225,24 @@ def get_disparity(symbol: str, cfg: dict) -> dict | None:
 ZONE_EMOJI = {"overheat": "🔴", "caution": "🟠", "normal": "🟢", "cooldown": "🔵"}
 
 
+# ─── CBOE Put/Call Ratio ─────────────────────────────────────────────────────
+def get_equity_pcr() -> dict | None:
+    url = "https://www.cboe.com/publish/scheduledtask/mktdata/datahouse/equitypc.csv"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        lines = [l for l in r.text.strip().split('\n') if l.strip()]
+        last = lines[-1].split(',')
+        pcr = float(last[-1].strip())
+        if   pcr >= 1.3: zone, label = "fear",    "공포 🔴  (Put 과잉, 역발상 매수 고려)"
+        elif pcr >= 1.0: zone, label = "caution", "주의 🟠  (하락 우려 우세)"
+        elif pcr <= 0.6: zone, label = "greed",   "탐욕 🟢  (Call 과잉, 역발상 매도 고려)"
+        else:            zone, label = "normal",  "중립 ⚪"
+        return {"pcr": pcr, "zone": zone, "label": label}
+    except Exception as e:
+        print(f"  PCR 오류: {e}")
+        return None
+
+
 # ─── Yahoo Finance ────────────────────────────────────────────────────────────
 def get_yf_price(symbol: str) -> dict | None:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -352,11 +370,12 @@ def main():
             both.append(s)
 
     # ── 8. VIX ──────────────────────────────────────────────────────────
-    print("[8] VIX 수집")
-    vix  = get_yf_price("%5EVIX")
+    print("[8] VIX / PCR 수집")
+    vix   = get_yf_price("%5EVIX")
     vix1m = get_yf_price("%5EVIX1M")
-    vxmt = get_yf_price("%5EVXMT")
-    vvix = get_yf_price("%5EVVIX")
+    vxmt  = get_yf_price("%5EVXMT")
+    vvix  = get_yf_price("%5EVVIX")
+    pcr   = get_equity_pcr()
 
     # ════════════════════════════════════════════════════════════════════
     # 텔레그램 발송
@@ -459,6 +478,14 @@ def main():
     else:
         L = [f"🌡️ <b>VIX Term Structure</b> | {TODAY}",
              "⚠️ 데이터 수집 실패 — Yahoo Finance 응답 없음"]
+    # PCR 추가
+    L.append("")
+    if pcr:
+        L += [f"📊 <b>Equity Put/Call Ratio (PCR)</b>",
+              f"  PCR: {pcr['pcr']:.2f}  →  {pcr['label']}",
+              "  기준: ≤0.6 탐욕 | 0.6~1.0 중립 | 1.0~1.3 주의 | ≥1.3 공포"]
+    else:
+        L.append("📊 PCR: 데이터 수집 실패")
     send_tg("\n".join(L))
 
     # ── 메시지7: 50일 이격도 (미국 선물) ──────────────────────────────────────
