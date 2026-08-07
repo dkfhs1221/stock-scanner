@@ -226,17 +226,36 @@ ZONE_EMOJI = {"overheat": "🔴", "caution": "🟠", "normal": "🟢", "cooldown
 
 # ─── CBOE Put/Call Ratio ─────────────────────────────────────────────────────
 def get_equity_pcr() -> dict | None:
-    url = "https://www.cboe.com/publish/scheduledtask/mktdata/datahouse/equitypc.csv"
+    """CBOE 일별 통계 페이지에서 Equity PCR 스크래핑"""
+    url = "https://www.cboe.com/markets/us/options/market-statistics/daily/"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        lines = [l for l in r.text.strip().split('\n') if l.strip()]
-        last = lines[-1].split(',')
-        pcr = float(last[-1].strip())
-        if   pcr >= 1.3: zone, label = "fear",    "공포 🔴  (Put 과잉, 역발상 매수 고려)"
-        elif pcr >= 1.0: zone, label = "caution", "주의 🟠  (하락 우려 우세)"
-        elif pcr <= 0.6: zone, label = "greed",   "탐욕 🟢  (Call 과잉, 역발상 매도 고려)"
-        else:            zone, label = "normal",  "중립 ⚪"
-        return {"pcr": pcr, "zone": zone, "label": label}
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            print(f"  PCR HTTP {r.status_code}")
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        # 테이블에서 "EQUITY PUT/CALL RATIO" 행 찾기
+        for td in soup.find_all("td"):
+            if "EQUITY PUT/CALL RATIO" in td.get_text(strip=True).upper():
+                sib = td.find_next_sibling("td")
+                if sib:
+                    pcr = float(sib.get_text(strip=True))
+                    if   pcr >= 1.3: zone, lbl = "fear",    "공포 🔴  (Put 과잉, 역발상 매수 고려)"
+                    elif pcr >= 1.0: zone, lbl = "caution", "주의 🟠  (하락 우려 우세)"
+                    elif pcr <= 0.6: zone, lbl = "greed",   "탐욕 🟢  (Call 과잉, 역발상 매도 고려)"
+                    else:            zone, lbl = "normal",  "중립 ⚪"
+                    return {"pcr": pcr, "zone": zone, "label": lbl}
+        # 정규식 백업
+        m = re.search(r"EQUITY PUT/CALL RATIO\D+([\d.]+)", r.text, re.I)
+        if m:
+            pcr = float(m.group(1))
+            if   pcr >= 1.3: zone, lbl = "fear",    "공포 🔴  (Put 과잉, 역발상 매수 고려)"
+            elif pcr >= 1.0: zone, lbl = "caution", "주의 🟠  (하락 우려 우세)"
+            elif pcr <= 0.6: zone, lbl = "greed",   "탐욕 🟢  (Call 과잉, 역발상 매도 고려)"
+            else:            zone, lbl = "normal",  "중립 ⚪"
+            return {"pcr": pcr, "zone": zone, "label": lbl}
+        print("  PCR: EQUITY PUT/CALL RATIO 항목을 찾을 수 없음")
+        return None
     except Exception as e:
         print(f"  PCR 오류: {e}")
         return None
