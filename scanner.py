@@ -11,6 +11,8 @@
   7. 50일 이격도 (S&P500선물 / 나스닥선물)
 KOSPI_ONLY=true (오후 4시 10분 KST) — 1개 메시지:
   8. 50일 이격도 (코스피 당일 종가 기준)
+WEEKLY_ONLY=true (월요일 오전 7시 KST) — 1개 메시지:
+  9. 주간 유동성 보고 (TGA / RRP)
 """
 
 import os, json, time, re, urllib.parse
@@ -21,7 +23,8 @@ from datetime import date
 # ─── 설정 ────────────────────────────────────────────────────────────────────
 TG_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 TG_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
-KOSPI_ONLY  = os.environ.get("KOSPI_ONLY", "").lower() in ("1", "true", "yes")
+KOSPI_ONLY   = os.environ.get("KOSPI_ONLY",  "").lower() in ("1", "true", "yes")
+WEEKLY_ONLY  = os.environ.get("WEEKLY_ONLY", "").lower() in ("1", "true", "yes")
 SNAPSHOT    = "data/snapshot.json"
 TODAY       = date.today().isoformat()
 
@@ -89,7 +92,6 @@ def vvix_label(v: float) -> str:
 
 # ─── Finviz 스크래핑 ──────────────────────────────────────────────────────────
 def get_count(filter_str: str) -> int:
-    """필터 조건에 맞는 총 종목 수 반환"""
     html = fetch(f"https://finviz.com/screener.ashx?v=111&f={filter_str}&r=1")
     if not html:
         return 0
@@ -105,7 +107,6 @@ def get_count(filter_str: str) -> int:
 
 
 def scrape_technical(idx_code: str) -> dict:
-    """Technical 뷰(v=171) — ticker: {sma200, price, indices}"""
     results = {}
     r = 1
     while True:
@@ -136,7 +137,6 @@ def scrape_technical(idx_code: str) -> dict:
 
 
 def _detect_col(html: str) -> tuple[int, int]:
-    """Overview 뷰의 price/change% td 인덱스 자동 탐지 (기본 8, 9)"""
     soup = BeautifulSoup(html, "html.parser")
     rows = soup.find_all("tr", valign="top")
     if not rows:
@@ -151,7 +151,6 @@ def _detect_col(html: str) -> tuple[int, int]:
 
 
 def scrape_overview(idx_code: str, extra: str = "") -> list[dict]:
-    """Overview 뷰(v=111) — [{ticker, price, change, idx}]"""
     results   = []
     price_idx = 8
     chg_idx   = 9
@@ -243,6 +242,66 @@ def get_equity_pcr() -> dict | None:
         return None
 
 
+# ─── TGA (재무부 일반계좌) ────────────────────────────────────────────────────
+def get_tga() -> dict | None:
+    """FiscalData API — 단위: 백만 달러 → 십억 달러로 변환"""
+    url = "https://api.fiscaldata.treasury.gov/services/api/v1/accounting/core/operating_cash_balance/"
+    try:
+        r = requests.get(url, params={
+            "fields": "record_date,open_today_bal",
+            "sort":   "-record_date",
+            "limit":  "10",
+        }, headers=HEADERS, timeout=20)
+        data = r.json().get("data", [])
+        if len(data) < 2:
+            return None
+        latest = data[0]
+        prev   = data[min(5, len(data) - 1)]
+        cur_b  = float(latest["open_today_bal"]) / 1_000
+        prv_b  = float(prev["open_today_bal"])   / 1_000
+        chg    = cur_b - prv_b
+        return {
+            "date":     latest["record_date"],
+            "current":  cur_b,
+            "previous": prv_b,
+            "change":   chg,
+        }
+    except Exception as e:
+        print(f"  TGA 오류: {e}")
+        return None
+
+
+# ─── RRP (역레포) ─────────────────────────────────────────────────────────────
+def get_rrp() -> dict | None:
+    """FRED RRPONTSYD — 단위: 십억 달러"""
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+    try:
+        r = requests.get(url, params={"id": "RRPONTSYD"}, headers=HEADERS, timeout=20)
+        lines = r.text.strip().split('\n')
+        valid = []
+        for line in lines:
+            parts = line.strip().split(',')
+            if len(parts) == 2 and parts[1] not in ('', '.', 'RRPONTSYD'):
+                try:
+                    valid.append((parts[0].strip(), float(parts[1].strip())))
+                except ValueError:
+                    pass
+        if len(valid) < 2:
+            return None
+        latest_date, cur_b = valid[-1]
+        _, prv_b            = valid[min(-6, -len(valid))]
+        chg = cur_b - prv_b
+        return {
+            "date":     latest_date,
+            "current":  cur_b,
+            "previous": prv_b,
+            "change":   chg,
+        }
+    except Exception as e:
+        print(f"  RRP 오류: {e}")
+        return None
+
+
 # ─── Yahoo Finance ────────────────────────────────────────────────────────────
 def get_yf_price(symbol: str) -> dict | None:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -288,11 +347,64 @@ def main():
         print("=== 완료 ===")
         return
 
+    # ── 주간 유동성 보고 모드 (월요일 오전 7시 7분 KST 별도 실행) ──────────────
+    if WEEKLY_ONLY:
+        print("[WEEKLY] TGA / RRP 수집")
+        tga = get_tga()
+        rrp = get_rrp()
+
+        L = [f"💧 <b>주간 유동성 보고</b> | {TODAY}", ""]
+
+        if tga:
+            arrow = "▼" if tga["change"] < 0 else "▲"
+            supply = tga["change"] < 0
+            L += [
+                f"🏦 <b>TGA (재무부 일반계좌)</b>  <i>{tga['date']}</i>",
+                f"  잔고: ${tga['current']:.1f}B",
+                f"  전주 대비: {arrow} ${abs(tga['change']):.1f}B",
+                f"  → {'유동성 공급 ✅  (TGA↓ = 달러 시장 방출)' if supply else '유동성 흡수 ⚠️  (TGA↑ = 달러 시장 회수)'}",
+                "",
+            ]
+        else:
+            L += ["🏦 TGA: 데이터 수집 실패", ""]
+
+        if rrp:
+            arrow = "▼" if rrp["change"] < 0 else "▲"
+            supply = rrp["change"] < 0
+            L += [
+                f"💰 <b>RRP (역레포)</b>  <i>{rrp['date']}</i>",
+                f"  잔고: ${rrp['current']:.1f}B",
+                f"  전주 대비: {arrow} ${abs(rrp['change']):.1f}B",
+                f"  → {'유동성 공급 ✅  (RRP↓ = MMF 자금 시장 이동)' if supply else '유동성 흡수 ⚠️  (RRP↑ = MMF 자금 안전자산 이동)'}",
+                "",
+            ]
+        else:
+            L += ["💰 RRP: 데이터 수집 실패", ""]
+
+        if tga and rrp:
+            ts = tga["change"] < 0
+            rs = rrp["change"] < 0
+            if ts and rs:
+                judge = "TGA↓ + RRP↓  →  이중 공급 ✅✅  시장에 긍정적"
+            elif ts or rs:
+                judge = "혼재 신호  →  효과 제한적 ⚠️"
+            else:
+                judge = "TGA↑ + RRP↑  →  이중 흡수 ⛔  시장에 부정적"
+            L += [f"📊 <b>종합 판단</b>", f"  {judge}", ""]
+
+        L += [
+            "TGA↓·RRP↓ = 유동성 공급 | TGA↑·RRP↑ = 유동성 흡수",
+            "출처: US Treasury FiscalData · FRED(RRPONTSYD)",
+        ]
+
+        send_tg("\n".join(L))
+        print("=== 완료 ===")
+        return
+
     snap     = load_snapshot()
     prev_date = snap.get("date")
     prev_sma  = snap.get("sma200", {})
 
-    # ── 1. Technical 데이터 수집 (200일선용) ──────────────────────────────
     print("[1] Technical 데이터 수집")
     all_data: dict[str, dict] = {}
     for idx in IDX_ORDER:
@@ -307,7 +419,6 @@ def main():
     total = len(all_data)
     print(f"  총 {total}개")
 
-    # ── 2. 200일선 돌파 탐지 ─────────────────────────────────────────────
     bo_by_idx: dict[str, list] = {i: [] for i in IDX_ORDER}
     bo_all: set[str] = set()
     if prev_date and prev_date != TODAY:
@@ -323,11 +434,9 @@ def main():
         for idx in IDX_ORDER:
             bo_by_idx[idx].sort(key=lambda x: float(x["sma200"]), reverse=True)
 
-    # ── 3. 스냅샷 저장 ───────────────────────────────────────────────────
     save_snapshot({"date": TODAY, "sma200": {t: d["sma200"] for t, d in all_data.items()}})
     print(f"[3] 스냅샷 저장 완료")
 
-    # ── 4. 브레드스 ──────────────────────────────────────────────────────
     print("[4] 브레드스 수집")
     breadth: dict[str, dict] = {}
     for idx in IDX_ORDER:
@@ -341,7 +450,6 @@ def main():
         }
         time.sleep(0.5)
 
-    # ── 5. 거래량 급증 ───────────────────────────────────────────────────
     print("[5] 거래량 급증 스캐너")
     vol_by_idx: dict[str, list] = {i: [] for i in IDX_ORDER}
     for idx in IDX_ORDER:
@@ -352,7 +460,6 @@ def main():
         )
         time.sleep(1)
 
-    # ── 6. 52주 신고가 ──────────────────────────────────────────────────
     print("[6] 52주 신고가 스캐너")
     hi_by_idx: dict[str, list] = {i: [] for i in IDX_ORDER}
     for idx in IDX_ORDER:
@@ -360,7 +467,6 @@ def main():
         hi_by_idx[idx] = sorted(stocks, key=lambda x: x["change"], reverse=True)
         time.sleep(1)
 
-    # ── 7. 교집합 ────────────────────────────────────────────────────────
     vol_set = {s["ticker"] for v in vol_by_idx.values() for s in v}
     seen: set[str] = set()
     both: list[dict] = []
@@ -369,7 +475,6 @@ def main():
             seen.add(s["ticker"])
             both.append(s)
 
-    # ── 8. VIX ──────────────────────────────────────────────────────────
     print("[8] VIX / PCR 수집")
     vix   = get_yf_price("%5EVIX")
     vix1m = get_yf_price("%5EVIX1M")
@@ -377,12 +482,8 @@ def main():
     vvix  = get_yf_price("%5EVVIX")
     pcr   = get_equity_pcr()
 
-    # ════════════════════════════════════════════════════════════════════
-    # 텔레그램 발송
-    # ════════════════════════════════════════════════════════════════════
     print("[9] 텔레그램 발송")
 
-    # ── 메시지1: 200일선 돌파 ──────────────────────────────────────────
     L = [f"📊 <b>200일선 돌파 스캐너</b> | {TODAY}",
          f"총 스캔: {total:,}개  |  돌파: {len(bo_all)}개"]
     if not prev_date:
@@ -400,7 +501,6 @@ def main():
                 L.append(f"  ... 외 {len(items)-50}개")
     send_tg("\n".join(L));  time.sleep(1)
 
-    # ── 메시지2: 브레드스 ─────────────────────────────────────────────
     L = [f"📈 <b>시장 브레드스</b> | {TODAY}", "",
          "         50MA위   200MA위"]
     for idx in IDX_ORDER:
@@ -409,7 +509,6 @@ def main():
     L += ["", "⚠️ 기준: 50MA / 200MA 40% 이하 = 시장 약세 신호"]
     send_tg("\n".join(L));  time.sleep(1)
 
-    # ── 메시지3: 거래량 급증 ───────────────────────────────────────────
     vol_total = sum(len(v) for v in vol_by_idx.values())
     L = [f"🔥 <b>거래량 급증 스캐너</b> | {TODAY}",
          f"조건: 거래량2배↑ · 50MA위 · 당일+3%↑  |  총 {vol_total}개"]
@@ -426,7 +525,6 @@ def main():
                 L.append(f"  ... 외 {len(items)-50}개")
     send_tg("\n".join(L));  time.sleep(1)
 
-    # ── 메시지4: 52주 신고가 ──────────────────────────────────────────
     hi_total = sum(len(v) for v in hi_by_idx.values())
     L = [f"🏆 <b>52주 신고가 돌파</b> | {TODAY}", f"총 {hi_total}개"]
     if hi_total == 0:
@@ -442,7 +540,6 @@ def main():
                 L.append(f"  ... 외 {len(items)-50}개")
     send_tg("\n".join(L));  time.sleep(1)
 
-    # ── 메시지5: 교집합 ───────────────────────────────────────────────
     L = [f"⭐ <b>거래량급증 + 신고가 동시 돌파</b> | {TODAY}",
          f"강력 모멘텀 신호  |  총 {len(both)}개"]
     if not both:
@@ -453,7 +550,6 @@ def main():
             L.append(f"  <code>{s['ticker']}</code>  ${s['price']:.2f}  +{s['change']:.2f}%")
     send_tg("\n".join(L));  time.sleep(1)
 
-    # ── 메시지6: VIX Term Structure ───────────────────────────────────
     if vix and vxmt and vvix:
         v1 = vix1m["price"] if vix1m else vix["price"]
         v1_note = "" if vix1m else " (Spot VIX)"
@@ -478,7 +574,6 @@ def main():
     else:
         L = [f"🌡️ <b>VIX Term Structure</b> | {TODAY}",
              "⚠️ 데이터 수집 실패 — Yahoo Finance 응답 없음"]
-    # PCR 추가
     L.append("")
     if pcr:
         L += [f"📊 <b>Equity Put/Call Ratio (PCR)</b>",
@@ -488,7 +583,6 @@ def main():
         L.append("📊 PCR: 데이터 수집 실패")
     send_tg("\n".join(L))
 
-    # ── 메시지7: 50일 이격도 (미국 선물) ──────────────────────────────────────
     print("[10] 50일 이격도 수집 (미국 선물)")
     US_KEYS = ["sp500", "nasdaq"]
     disp_results = {}
