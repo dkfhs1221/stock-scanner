@@ -2,7 +2,7 @@ name: 코스피 이격도
 
 on:
   schedule:
-    - cron: "10 7 * * 2-6"
+    - cron: "44 7 * * 2-6"
   workflow_dispatch:
 
 jobs:
