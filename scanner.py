@@ -628,7 +628,7 @@ def main():
         elif d["zone"] == "cooldown":
             L.append(f"  🔵 Panic Selling 자제, 이격 조정 끝난 업종 관심")
         L.append("")
-    L += ["이격도 = 현재가 ÷ 50일선 × 100"
+    L += ["이격도 = 현재가 ÷ 50일선 × 100"]
     send_tg("\n".join(L));  time.sleep(1)
 
     print("=== 완료 ===")
