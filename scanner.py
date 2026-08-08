@@ -18,7 +18,7 @@ WEEKLY_ONLY=true (월요일 오전 7시 KST) — 1개 메시지:
 import os, json, time, re, urllib.parse
 import requests
 from bs4 import BeautifulSoup
-from datetime import date
+from datetime import date, timedelta
 
 # ─── 설정 ────────────────────────────────────────────────────────────────────
 TG_TOKEN    = os.environ["TELEGRAM_TOKEN"]
@@ -284,18 +284,27 @@ def get_fear_greed() -> dict | None:
 
 
 # ─── TGA (재무부 일반계좌) ────────────────────────────────────────────────────
+def _nearest(by_date: dict, target: str) -> float | None:
+    """target 날짜 이하 중 가장 가까운 값 반환"""
+    cands = [dt for dt in by_date if dt <= target]
+    if not cands:
+        return None
+    return by_date[max(cands)]
+
+
 def get_tga() -> dict | None:
     """Treasury FiscalData DTS — TGA 마감잔고 (백만달러→십억달러)"""
     url = (
         "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
         "/v1/accounting/dts/operating_cash_balance"
     )
+    today = date.today()
     try:
         r = requests.get(url, params={
             "fields":     "record_date,account_type,open_today_bal",
             "filter":     "account_type:eq:Treasury General Account (TGA) Closing Balance",
             "sort":       "-record_date",
-            "page[size]": "10",
+            "page[size]": "100",
         }, headers={**HEADERS, "Accept": "application/json"}, timeout=25)
         r.raise_for_status()
         data = r.json().get("data", [])
@@ -305,14 +314,18 @@ def get_tga() -> dict | None:
         by_date: dict[str, float] = {}
         for row in data:
             dt  = row["record_date"]
-            val = float(row["open_today_bal"])
-            by_date[dt] = val
+            by_date[dt] = float(row["open_today_bal"]) / 1_000  # 십억달러
         dates = sorted(by_date.keys(), reverse=True)
-        if len(dates) < 2:
+        if not dates:
             return None
-        cur_b = by_date[dates[0]] / 1_000
-        prv_b = by_date[dates[min(5, len(dates) - 1)]] / 1_000
-        return {"date": dates[0], "current": cur_b, "previous": prv_b, "change": cur_b - prv_b}
+        cur = by_date[dates[0]]
+        return {
+            "date": dates[0], "current": cur,
+            "w1": _nearest(by_date, (today - timedelta(weeks=1)).isoformat()),
+            "w2": _nearest(by_date, (today - timedelta(weeks=2)).isoformat()),
+            "m1": _nearest(by_date, (today - timedelta(days=30)).isoformat()),
+            "m3": _nearest(by_date, (today - timedelta(days=91)).isoformat()),
+        }
     except Exception as e:
         print(f"  TGA 오류: {e}")
         return None
@@ -320,8 +333,9 @@ def get_tga() -> dict | None:
 
 # ─── RRP (역레포) — NY Fed API ────────────────────────────────────────────────
 def get_rrp() -> dict | None:
-    """NY Fed 역레포 — totalAmtAccepted 달러→십억달러"""
-    url = "https://markets.newyorkfed.org/api/rp/reverserepo/all/results/lastTwoWeeks.json"
+    """NY Fed 역레포 — totalAmtAccepted 달러→십억달러 (최근 3개월)"""
+    url = "https://markets.newyorkfed.org/api/rp/reverserepo/all/results/last3months.json"
+    today = date.today()
     try:
         r = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=20)
         r.raise_for_status()
@@ -330,18 +344,22 @@ def get_rrp() -> dict | None:
         daily: dict[str, float] = {}
         for op in ops:
             dt  = op.get("operationDate", "")[:10]
-            amt = float(op.get("totalAmtAccepted", 0)) / 1_000_000_000   # 달러 → 십억
+            amt = float(op.get("totalAmtAccepted", 0)) / 1_000_000_000
             if dt:
                 daily[dt] = daily.get(dt, 0) + amt
         dates = sorted(daily.keys())
-        print(f"  RRP dates: {dates}")
-        if len(dates) < 2:
+        print(f"  RRP dates: {dates[-5:]}")
+        if not dates:
             return None
-        latest_date = dates[-1]
-        prev_date   = dates[max(0, len(dates) - 6)]
-        cur_b = daily[latest_date]
-        prv_b = daily[prev_date]
-        return {"date": latest_date, "current": cur_b, "previous": prv_b, "change": cur_b - prv_b}
+        latest = dates[-1]
+        cur = daily[latest]
+        return {
+            "date": latest, "current": cur,
+            "w1": _nearest(daily, (today - timedelta(weeks=1)).isoformat()),
+            "w2": _nearest(daily, (today - timedelta(weeks=2)).isoformat()),
+            "m1": _nearest(daily, (today - timedelta(days=30)).isoformat()),
+            "m3": _nearest(daily, (today - timedelta(days=91)).isoformat()),
+        }
     except Exception as e:
         print(f"  RRP 오류: {e}")
         return None
@@ -393,30 +411,43 @@ def main():
         print("[WEEKLY] TGA / RRP 수집")
         tga = get_tga()
         rrp = get_rrp()
+        def _chg_line(cur, ref, lbl):
+            if ref is None:
+                return f"  {lbl}: 데이터 없음"
+            chg = cur - ref
+            arrow = "▼" if chg < 0 else "▲"
+            return f"  {lbl}: {arrow} ${abs(chg):.1f}B"
+
         L = [f"💧 <b>주간 유동성 보고</b> | {TODAY}", ""]
         if tga:
-            arrow = "▼" if tga["change"] < 0 else "▲"
-            supply = tga["change"] < 0
+            cur = tga["current"]
+            supply = (tga["w1"] or cur) > cur
             L += [f"🏦 <b>TGA (재무부 일반계좌)</b>  <i>{tga['date']}</i>",
-                  f"  잔고: ${tga['current']:.1f}B",
-                  f"  전주 대비: {arrow} ${abs(tga['change']):.1f}B",
+                  f"  잔고: ${cur:.1f}B",
+                  _chg_line(cur, tga["w1"], "1주 전 대비"),
+                  _chg_line(cur, tga["w2"], "2주 전 대비"),
+                  _chg_line(cur, tga["m1"], "1개월 전 대비"),
+                  _chg_line(cur, tga["m3"], "3개월 전 대비"),
                   f"  → {'유동성 공급 ✅  (TGA↓ = 달러 시장 방출)' if supply else '유동성 흡수 ⚠️  (TGA↑ = 달러 시장 회수)'}",
                   ""]
         else:
             L += ["🏦 TGA: 데이터 수집 실패", ""]
         if rrp:
-            arrow = "▼" if rrp["change"] < 0 else "▲"
-            supply = rrp["change"] < 0
+            cur = rrp["current"]
+            supply = (rrp["w1"] or cur) > cur
             L += [f"💰 <b>RRP (역레포)</b>  <i>{rrp['date']}</i>",
-                  f"  잔고: ${rrp['current']:.1f}B",
-                  f"  전주 대비: {arrow} ${abs(rrp['change']):.1f}B",
+                  f"  잔고: ${cur:.1f}B",
+                  _chg_line(cur, rrp["w1"], "1주 전 대비"),
+                  _chg_line(cur, rrp["w2"], "2주 전 대비"),
+                  _chg_line(cur, rrp["m1"], "1개월 전 대비"),
+                  _chg_line(cur, rrp["m3"], "3개월 전 대비"),
                   f"  → {'유동성 공급 ✅  (RRP↓ = MMF 자금 시장 이동)' if supply else '유동성 흡수 ⚠️  (RRP↑ = MMF 자금 안전자산 이동)'}",
                   ""]
         else:
             L += ["💰 RRP: 데이터 수집 실패", ""]
         if tga and rrp:
-            ts = tga["change"] < 0
-            rs = rrp["change"] < 0
+            ts = (tga["w1"] or tga["current"]) > tga["current"]
+            rs = (rrp["w1"] or rrp["current"]) > rrp["current"]
             if ts and rs:   judge = "TGA↓ + RRP↓  →  이중 공급 ✅✅  시장에 긍정적"
             elif ts or rs:  judge = "혼재 신호  →  효과 제한적 ⚠️"
             else:           judge = "TGA↑ + RRP↑  →  이중 흡수 ⛔  시장에 부정적"
