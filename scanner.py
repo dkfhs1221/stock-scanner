@@ -334,7 +334,7 @@ def get_tga() -> dict | None:
 # ─── RRP (역레포) — NY Fed API ────────────────────────────────────────────────
 def get_rrp() -> dict | None:
     """NY Fed 역레포 — totalAmtAccepted 달러→십억달러 (최근 3개월)"""
-    url = "https://markets.newyorkfed.org/api/rp/reverserepo/all/results/last3months.json"
+    url = "https://markets.newyorkfed.org/api/rp/reverserepo/all/results/lastTwoWeeks.json"
     today = date.today()
     try:
         r = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=20)
