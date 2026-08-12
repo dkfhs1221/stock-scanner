@@ -380,6 +380,27 @@ def get_yf_price(symbol: str) -> dict | None:
         return None
 
 
+
+def verify_breakout_close(ticker: str) -> bool:
+    """Yahoo Finance 종가 기준 200일선 돌파 여부 검증"""
+    enc = urllib.parse.quote(ticker, safe="")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{enc}"
+    try:
+        r = requests.get(url, params={"range": "1y", "interval": "1d"},
+                         headers={**HEADERS, "Accept": "application/json"}, timeout=15)
+        result = r.json()["chart"]["result"][0]
+        closes = [c for c in result["indicators"]["quote"][0]["close"] if c is not None]
+        if len(closes) < 201:
+            return False
+        last_close = closes[-1]
+        prev_close = closes[-2]
+        ma200_today = sum(closes[-200:]) / 200
+        ma200_prev  = sum(closes[-201:-1]) / 200
+        return prev_close <= ma200_prev and last_close > ma200_today
+    except Exception as e:
+        print(f"  YF 검증 오류 ({ticker}): {e}")
+        return False
+
 # ─── 메인 ────────────────────────────────────────────────────────────────────
 def main():
     print(f"=== 스캐너 시작: {TODAY} ===")
@@ -483,11 +504,13 @@ def main():
             pv = prev_sma.get(ticker)
             cv = d["sma200"]
             if pv is not None and pv <= 0 < cv:
-                bo_all.add(ticker)
-                for idx in d["indices"]:
-                    bo_by_idx[idx].append(
-                        {"ticker": ticker, "sma200": f"{cv:+.2f}", "price": d["price"]}
-                    )
+                if verify_breakout_close(ticker):
+                    bo_all.add(ticker)
+                    for idx in d["indices"]:
+                        bo_by_idx[idx].append(
+                            {"ticker": ticker, "sma200": f"{cv:+.2f}", "price": d["price"]}
+                        )
+                time.sleep(0.3)
         for idx in IDX_ORDER:
             bo_by_idx[idx].sort(key=lambda x: float(x["sma200"]), reverse=True)
 
