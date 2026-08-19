@@ -547,11 +547,13 @@ def main():
             pv = prev_sma.get(ticker)
             cv = d["sma200"]
             if pv is not None and pv <= 0 < cv:
-                if verify_breakout_close(ticker):
+                m = get_yf_close_metrics(ticker)
+                if m and m["prev"] <= m["ma200_prev"] and m["last"] > m["ma200"]:
                     bo_all.add(ticker)
                     for idx in d["indices"]:
                         bo_by_idx[idx].append(
-                            {"ticker": ticker, "sma200": f"{cv:+.2f}", "price": d["price"]}
+                            {"ticker": ticker, "sma200": f"{cv:+.2f}",
+                             "price": f"{m['last']:.2f}"}
                         )
                 time.sleep(0.3)
         for idx in IDX_ORDER:
@@ -579,21 +581,27 @@ def main():
     vol_by_idx: dict[str, list] = {i: [] for i in IDX_ORDER}
     for idx in IDX_ORDER:
         stocks = scrape_overview(idx, "sh_relvol_o2,ta_sma50_pa")
-        vol_by_idx[idx] = sorted(
-            [s for s in stocks if s["change"] >= 3.0 and
-             verify_volume_scanner_close(s["ticker"])],
-            key=lambda x: x["change"], reverse=True
-        )
+        verified = []
+        for s in stocks:
+            m = get_yf_close_metrics(s["ticker"])
+            if m and m["last"] > m["ma50"] and m["prev"] and                     (m["last"] / m["prev"] - 1) >= 0.03:
+                verified.append({**s, "price": m["last"],
+                                 "change": (m["last"] / m["prev"] - 1) * 100})
+        vol_by_idx[idx] = sorted(verified, key=lambda x: x["change"], reverse=True)
         time.sleep(1)
 
     print("[6] 52주 신고가 스캐너")
     hi_by_idx: dict[str, list] = {i: [] for i in IDX_ORDER}
     for idx in IDX_ORDER:
         stocks = scrape_overview(idx, "ta_highlow52w_nh")
-        hi_by_idx[idx] = sorted(
-            [s for s in stocks if verify_52week_high_close(s["ticker"])],
-            key=lambda x: x["change"], reverse=True
-        )
+        verified = []
+        for s in stocks:
+            m = get_yf_close_metrics(s["ticker"])
+            if m and m["high52_prev"] is not None and m["last"] >= m["high52_prev"]:
+                verified.append({**s, "price": m["last"],
+                                 "change": ((m["last"] / m["prev"] - 1) * 100)
+                                           if m["prev"] else 0})
+        hi_by_idx[idx] = sorted(verified, key=lambda x: x["change"], reverse=True)
         time.sleep(1)
 
     vol_set = {s["ticker"] for v in vol_by_idx.values() for s in v}
