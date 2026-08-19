@@ -367,13 +367,17 @@ def get_rrp() -> dict | None:
 
 # ─── Yahoo Finance ────────────────────────────────────────────────────────────
 def get_yf_price(symbol: str) -> dict | None:
+    """VIX 계열도 장후 현재가가 아닌 Yahoo 확정 일봉 종가를 사용."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     try:
         r = requests.get(url, params={"interval": "1d", "range": "5d"},
                          headers={**HEADERS, "Accept": "application/json"}, timeout=15)
-        meta  = r.json()["chart"]["result"][0]["meta"]
-        price = meta.get("regularMarketPrice", 0)
-        prev  = meta.get("previousClose") or meta.get("chartPreviousClose") or price
+        closes = [c for c in r.json()["chart"]["result"][0]
+                  ["indicators"]["quote"][0]["close"] if c is not None]
+        if not closes:
+            return None
+        price = closes[-1]
+        prev = closes[-2] if len(closes) >= 2 else price
         return {"price": price, "chg_pct": (price - prev) / prev * 100 if prev else 0}
     except Exception as e:
         print(f"  YF 오류 ({symbol}): {e}")
@@ -381,25 +385,64 @@ def get_yf_price(symbol: str) -> dict | None:
 
 
 
-def verify_breakout_close(ticker: str) -> bool:
-    """Yahoo Finance 종가 기준 200일선 돌파 여부 검증"""
-    enc = urllib.parse.quote(ticker, safe="")
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{enc}"
+YF_DAILY_CACHE: dict[str, list[float] | None] = {}
+
+
+def get_yf_closes(ticker: str) -> list[float] | None:
+    """Yahoo 일봉 종가를 조회·캐시한다. 장후 가격 대신 확정 일봉 종가만 사용."""
+    if ticker in YF_DAILY_CACHE:
+        return YF_DAILY_CACHE[ticker]
+    symbol = urllib.parse.quote(ticker.replace(".", "-"), safe="")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     try:
-        r = requests.get(url, params={"range": "1y", "interval": "1d"},
+        r = requests.get(url, params={"range": "2y", "interval": "1d"},
                          headers={**HEADERS, "Accept": "application/json"}, timeout=15)
         result = r.json()["chart"]["result"][0]
         closes = [c for c in result["indicators"]["quote"][0]["close"] if c is not None]
-        if len(closes) < 201:
-            return False
-        last_close = closes[-1]
-        prev_close = closes[-2]
-        ma200_today = sum(closes[-200:]) / 200
-        ma200_prev  = sum(closes[-201:-1]) / 200
-        return prev_close <= ma200_prev and last_close > ma200_today
+        YF_DAILY_CACHE[ticker] = closes if len(closes) >= 201 else None
     except Exception as e:
-        print(f"  YF 검증 오류 ({ticker}): {e}")
-        return False
+        print(f"  YF 종가 조회 오류 ({ticker}): {e}")
+        YF_DAILY_CACHE[ticker] = None
+    return YF_DAILY_CACHE[ticker]
+
+
+def get_yf_close_metrics(ticker: str) -> dict | None:
+    closes = get_yf_closes(ticker)
+    if not closes or len(closes) < 201:
+        return None
+    return {
+        "last": closes[-1],
+        "prev": closes[-2],
+        "ma50": sum(closes[-50:]) / 50,
+        "ma200": sum(closes[-200:]) / 200,
+        "ma200_prev": sum(closes[-201:-1]) / 200,
+        "high52_prev": max(closes[-253:-1]) if len(closes) >= 253 else None,
+    }
+
+
+def verify_breakout_close(ticker: str) -> bool:
+    """종가가 전일 200MA 이하에서 당일 200MA 위로 올라섰는지 검증."""
+    m = get_yf_close_metrics(ticker)
+    return bool(m and m["prev"] <= m["ma200_prev"] and m["last"] > m["ma200"])
+
+
+def verify_above_ma_close(ticker: str, days: int) -> bool:
+    """Yahoo 확정 종가가 해당 이동평균선 위인지 검증."""
+    m = get_yf_close_metrics(ticker)
+    return bool(m and m["last"] > m[f"ma{days}"])
+
+
+def verify_volume_scanner_close(ticker: str) -> bool:
+    """거래량 후보의 +3%와 50MA 위 조건을 Yahoo 종가로 재검증."""
+    m = get_yf_close_metrics(ticker)
+    return bool(m and m["last"] > m["ma50"] and m["prev"] and
+                (m["last"] / m["prev"] - 1) >= 0.03)
+
+
+def verify_52week_high_close(ticker: str) -> bool:
+    """당일 종가가 직전 252거래일 종가 최고치를 넘었는지 검증."""
+    m = get_yf_close_metrics(ticker)
+    return bool(m and m["high52_prev"] is not None and m["last"] >= m["high52_prev"])
 
 # ─── 메인 ────────────────────────────────────────────────────────────────────
 def main():
@@ -517,16 +560,18 @@ def main():
     save_snapshot({"date": TODAY, "sma200": {t: d["sma200"] for t, d in all_data.items()}})
     print("[3] 스냅샷 저장 완료")
 
-    print("[4] 브레드스 수집")
+    print("[4] 브레드스 수집 및 Yahoo 종가 검증")
     breadth: dict[str, dict] = {}
     for idx in IDX_ORDER:
-        n    = get_count(f"idx_{idx}")
-        a50  = get_count(f"idx_{idx},ta_sma50_pa")
-        a200 = get_count(f"idx_{idx},ta_sma200_pa")
+        n = get_count(f"idx_{idx}")
+        finviz_50 = scrape_overview(idx, "ta_sma50_pa")
+        finviz_200 = scrape_overview(idx, "ta_sma200_pa")
+        a50 = sum(verify_above_ma_close(s["ticker"], 50) for s in finviz_50)
+        a200 = sum(verify_above_ma_close(s["ticker"], 200) for s in finviz_200)
         breadth[idx] = {
             "n": n,
-            "p50":  f"{a50 /n*100:.1f}" if n else "?",
-            "p200": f"{a200/n*100:.1f}" if n else "?",
+            "p50":  f"{a50 / n * 100:.1f}" if n else "?",
+            "p200": f"{a200 / n * 100:.1f}" if n else "?",
         }
         time.sleep(0.5)
 
@@ -535,7 +580,8 @@ def main():
     for idx in IDX_ORDER:
         stocks = scrape_overview(idx, "sh_relvol_o2,ta_sma50_pa")
         vol_by_idx[idx] = sorted(
-            [s for s in stocks if s["change"] >= 3.0],
+            [s for s in stocks if s["change"] >= 3.0 and
+             verify_volume_scanner_close(s["ticker"])],
             key=lambda x: x["change"], reverse=True
         )
         time.sleep(1)
@@ -544,7 +590,10 @@ def main():
     hi_by_idx: dict[str, list] = {i: [] for i in IDX_ORDER}
     for idx in IDX_ORDER:
         stocks = scrape_overview(idx, "ta_highlow52w_nh")
-        hi_by_idx[idx] = sorted(stocks, key=lambda x: x["change"], reverse=True)
+        hi_by_idx[idx] = sorted(
+            [s for s in stocks if verify_52week_high_close(s["ticker"])],
+            key=lambda x: x["change"], reverse=True
+        )
         time.sleep(1)
 
     vol_set = {s["ticker"] for v in vol_by_idx.values() for s in v}
