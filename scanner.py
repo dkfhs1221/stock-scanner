@@ -614,8 +614,7 @@ def main():
 
     print("[8] VIX / PCR / Fear&Greed 수집")
     vix   = get_yf_price("%5EVIX")
-    vix1m = get_yf_price("%5EVIX1M")
-    vxmt  = get_yf_price("%5EVXMT")
+    vix3m = get_yf_price("%5EVIX3M")
     vvix  = get_yf_price("%5EVVIX")
     pcr   = get_equity_pcr()
     fg    = get_fear_greed()
@@ -693,10 +692,9 @@ def main():
     send_tg("\n".join(L));  time.sleep(1)
 
     # 메시지6: VIX + PCR + Fear&Greed
-    if vix and vxmt and vvix:
-        v1 = vix1m["price"] if vix1m else vix["price"]
-        v1_note = "" if vix1m else " (Spot VIX)"
-        v3 = vxmt["price"]
+    if vix and vix3m and vvix:
+        v1 = vix["price"]
+        v3 = vix3m["price"]
         diff = v1 - v3
         if   diff > 0: ts = "Backwardation ⚠️\n→ 단기공포 신호 (급락 전 선행 패턴)"
         elif diff < 0: ts = "Contango ✅\n→ 정상 구조 (장기불확실성 > 단기)"
@@ -705,11 +703,10 @@ def main():
         vv = vvix["price"]
         L = [
             f"🌡️ <b>VIX Term Structure</b> | {TODAY}", "",
-            f"VIX:    {vix['price']:.2f}  ({vix['chg_pct']:+.1f}%)",
-            f"VIX1M:  {v1:.2f}{v1_note}",
-            f"VIX3M:  {v3:.2f}  (VXMT 93일)", "",
+            f"VIX Spot: {v1:.2f}  ({vix['chg_pct']:+.1f}%)",
+            f"VIX3M:    {v3:.2f}", "",
             f"Term Structure: {ts}{extra}",
-            f"Spread: {diff:+.2f}pt (VIX1M - VIX3M)", "",
+            f"Spread: {diff:+.2f}pt (VIX Spot - VIX3M)", "",
             f"VVIX: {vv:.0f}  {vvix_label(vv)}",
             "80↓안정 | 80~100정상 | 100~120경계⚡",
             "120~140위험🔴 | 140~160강한공포 | 160↑금융스트레스🆘",
