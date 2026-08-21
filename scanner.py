@@ -562,17 +562,15 @@ def main():
     save_snapshot({"date": TODAY, "sma200": {t: d["sma200"] for t, d in all_data.items()}})
     print("[3] 스냅샷 저장 완료")
 
-    print("[4] 브레드스 수집 및 Yahoo 종가 검증")
+    print("[4] 브레드스 수집")
     breadth: dict[str, dict] = {}
     for idx in IDX_ORDER:
         n = get_count(f"idx_{idx}")
-        finviz_50 = scrape_overview(idx, "ta_sma50_pa")
-        finviz_200 = scrape_overview(idx, "ta_sma200_pa")
-        a50 = sum(verify_above_ma_close(s["ticker"], 50) for s in finviz_50)
-        a200 = sum(verify_above_ma_close(s["ticker"], 200) for s in finviz_200)
+        a50  = get_count(f"idx_{idx},ta_sma50_pa")
+        a200 = get_count(f"idx_{idx},ta_sma200_pa")
         breadth[idx] = {
             "n": n,
-            "p50":  f"{a50 / n * 100:.1f}" if n else "?",
+            "p50":  f"{a50  / n * 100:.1f}" if n else "?",
             "p200": f"{a200 / n * 100:.1f}" if n else "?",
         }
         time.sleep(0.5)
